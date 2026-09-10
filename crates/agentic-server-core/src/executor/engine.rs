@@ -527,7 +527,7 @@ fn finalize_loop(
     payload.output = combined_output;
     payload.usage = combined_usage;
     ctx.inject_ids(payload);
-    if let Some(tools) = registry.tool_search_response_tools() {
+    if let Some(tools) = registry.response_tools(ctx.enriched_request.tools.as_deref()) {
         payload.tools = Some(tools);
         payload.tool_choice = Some(ctx.enriched_request.tool_choice.clone().unwrap_or_default());
     }

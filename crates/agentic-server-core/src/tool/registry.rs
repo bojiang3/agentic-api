@@ -23,7 +23,7 @@ use super::{
 use crate::events::WireEvent;
 
 use crate::types::io::output::{FunctionToolCall, McpListTools};
-use crate::types::io::{InputItem, OutputItem, ResponsesInput};
+use crate::types::io::{InputItem, OutputItem, ResponsesInput, ToolChoice};
 use crate::types::request_response::RequestPayload;
 use crate::types::tools::{CodeInterpreterToolParam, FileSearchToolParam, ResponsesTool};
 use crate::utils::common::serialize_to_value;
@@ -359,11 +359,17 @@ impl ToolRegistry {
     }
 
     /// Public declarations to expose in response metadata. `Some([])` is
-    /// intentionally distinct from an inactive request.
+    /// intentionally distinct from an inactive request. Shell declarations are
+    /// also restored because their upstream function shape is private.
     #[must_use]
-    pub(crate) fn tool_search_response_tools(&self) -> Option<Vec<ResponsesTool>> {
-        let state = self.tool_search.as_deref().filter(|state| state.is_active())?;
-        let mut tools = state.public_response_tools();
+    pub(crate) fn response_tools(&self, request_tools: Option<&[ResponsesTool]>) -> Option<Vec<ResponsesTool>> {
+        let mut tools = if let Some(state) = self.tool_search.as_deref().filter(|state| state.is_active()) {
+            state.public_response_tools()
+        } else {
+            request_tools
+                .filter(|tools| tools.iter().any(|tool| matches!(tool, ResponsesTool::Shell(_))))?
+                .to_vec()
+        };
         for tool in &mut tools {
             tool.sanitize_for_persistence();
         }
@@ -393,20 +399,26 @@ impl ToolRegistry {
         ensure_request_prepared(request, self.tool_search.is_some())
     }
 
-    pub(crate) fn restore_tool_search_response_tools(&self, wire: &mut WireEvent) -> Result<(), ToolError> {
+    pub(crate) fn restore_response_tools(
+        &self,
+        wire: &mut WireEvent,
+        request: &RequestPayload,
+    ) -> Result<(), serde_json::Error> {
         let Some(response) = wire.rest.get_mut("response").and_then(Value::as_object_mut) else {
             return Ok(());
         };
-        if !response.contains_key("tools") {
-            return Ok(());
-        }
-        let Some(tools) = self.tool_search_response_tools() else {
+        let Some(tools) = self.response_tools(request.tools.as_deref()) else {
             return Ok(());
         };
-        response.insert(
-            "tools".to_owned(),
-            serialize_to_value(&tools).map_err(|_| super::tool_search::invalid_upstream_search_call())?,
-        );
+        if response.contains_key("tools") {
+            response.insert("tools".to_owned(), serialize_to_value(&tools)?);
+        }
+        if response.contains_key("tool_choice") {
+            response.insert(
+                "tool_choice".to_owned(),
+                serialize_to_value(request.tool_choice.as_ref().unwrap_or(&ToolChoice::Auto))?,
+            );
+        }
         Ok(())
     }
 

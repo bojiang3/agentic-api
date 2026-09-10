@@ -2229,8 +2229,12 @@ mod tests {
         registry
             .install_tool_search_state(Some(state))
             .expect("install prepared tool-search state");
-        let serialized = serde_json::to_value(registry.tool_search_response_tools().expect("active public tools"))
-            .expect("public tools serialize");
+        let serialized = serde_json::to_value(
+            registry
+                .response_tools(request.tools.as_deref())
+                .expect("active public tools"),
+        )
+        .expect("public tools serialize");
         let serialized = serialized.to_string();
 
         for secret in [

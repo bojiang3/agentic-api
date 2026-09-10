@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use agentic_core::executor::request::RequestContext;
 use agentic_core::executor::{ExecuteRequest, UpstreamBody, decode_upstream};
+use agentic_core::storage::InOutItem;
 use agentic_core::types::io::{InputItem, OutputItem, ResponsesInput, ShellCall, ShellCallStatus};
 use agentic_core::types::request_response::{RequestPayload, ResponsePayload};
 use either::Either;
@@ -177,10 +178,19 @@ async fn run(request: RequestPayload, ctx: Arc<agentic_core::executor::Execution
 #[tokio::test]
 async fn client_shell_continuation_blocking_and_streaming() {
     for stream in [false, true] {
-        let fixture =
-            support::TestFixture::new_with_responses(vec![model_response(stream, true), model_response(stream, false)])
-                .await;
+        let fixture = support::TestFixture::new_with_responses(vec![
+            model_response(stream, true),
+            model_response(stream, false),
+            model_response(stream, false),
+        ])
+        .await;
         let first = run(request(stream), fixture.exec_ctx.clone()).await;
+        let public_tools = json!([{"type": "shell", "environment": {"type": "local"}}]);
+        assert_eq!(serde_json::to_value(&first.tools).unwrap(), public_tools);
+        assert_eq!(
+            serde_json::to_value(&first.tool_choice).unwrap(),
+            json!({"type": "shell"})
+        );
         let OutputItem::ShellCall(call) = &first.output[0] else {
             panic!("public shell call")
         };
@@ -191,9 +201,16 @@ async fn client_shell_continuation_blocking_and_streaming() {
             "default shell must wait for client execution"
         );
         let mut continuation = request(stream);
+        continuation.tools = None;
+        continuation.tool_choice = None;
         continuation.previous_response_id = Some(first.id);
         continuation.input = serde_json::from_value(json!([shell_output()])).unwrap();
         let final_response = run(continuation, fixture.exec_ctx.clone()).await;
+        assert_eq!(serde_json::to_value(&final_response.tools).unwrap(), public_tools);
+        assert_eq!(
+            serde_json::to_value(&final_response.tool_choice).unwrap(),
+            json!({"type": "shell"})
+        );
         assert_eq!(support::output_text(&final_response), "sandbox checked");
         let requests = fixture.request_bodies().await;
         let history = requests[1]["input"].as_array().unwrap();
@@ -210,6 +227,98 @@ async fn client_shell_continuation_blocking_and_streaming() {
                 .iter()
                 .any(|item| item["type"] == "shell_call" || item["type"] == "shell_call_output")
         );
+        let mut stored_context = context();
+        stored_context.original_request.previous_response_id = Some(final_response.id.clone());
+        let stored = fixture.exec_ctx.resp_handler.rehydrate(&stored_context).await.unwrap();
+        assert!(
+            stored
+                .iter()
+                .any(|item| matches!(item, InOutItem::Input(InputItem::ShellCallOutput(_))))
+        );
+
+        // A later turn must normalize the persisted public output as well as new outputs.
+        let mut third = request(stream);
+        third.previous_response_id = Some(final_response.id);
+        third.input = ResponsesInput::Text("Continue from the shell output".to_owned());
+        assert_eq!(
+            support::output_text(&run(third, fixture.exec_ctx.clone()).await),
+            "sandbox checked"
+        );
+    }
+}
+
+#[tokio::test]
+async fn submitted_shell_items_preserve_public_fields_in_storage() {
+    for conversation in [false, true] {
+        let fixture = support::TestFixture::new_with_responses(vec![model_response(false, false)]).await;
+        let mut req = request(false);
+        if conversation {
+            req.conversation_id = Some(fixture.exec_ctx.conv_handler.create().await.unwrap().conversation_id);
+        }
+        let mut call = shell_item("completed");
+        call["extension"] = json!("call metadata");
+        let mut output = shell_output();
+        output["max_output_length"] = json!(128);
+        output["extension"] = json!("output metadata");
+        req.input = serde_json::from_value(json!([call, output])).unwrap();
+        let conversation_id = req.conversation_id.clone();
+        let response = run(req, fixture.exec_ctx.clone()).await;
+        let mut ctx = context();
+        let stored = if let Some(id) = conversation_id {
+            ctx.original_request.conversation_id = Some(id.clone());
+            ctx.conversation_id = Some(id);
+            fixture.exec_ctx.conv_handler.rehydrate(&ctx).await.unwrap()
+        } else {
+            ctx.original_request.previous_response_id = Some(response.id);
+            fixture.exec_ctx.resp_handler.rehydrate(&ctx).await.unwrap()
+        };
+        let inputs = stored
+            .iter()
+            .filter_map(|item| match item {
+                InOutItem::Input(input) => Some(serde_json::to_value(input).unwrap()),
+                InOutItem::Output(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inputs, vec![call, output]);
+        let requests = fixture.request_bodies().await;
+        assert_eq!(requests[0]["input"][0]["type"], "function_call");
+        assert_eq!(requests[0]["input"][1]["type"], "function_call_output");
+    }
+}
+
+#[tokio::test]
+async fn shell_response_metadata_uses_public_declarations_and_selector() {
+    for tool_search in [false, true] {
+        let mut req = request(true);
+        if tool_search {
+            req.tools.as_mut().unwrap().push(
+                serde_json::from_value(json!({
+                    "type": "tool_search", "execution": "client"
+                }))
+                .unwrap(),
+            );
+        }
+        let expected_tools = serde_json::to_value(&req.tools).unwrap();
+        let item = json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "shell",
+            "status": "completed", "arguments": shell_item("completed")["action"].to_string()});
+        let mut events = lifecycle(&item);
+        for event in &mut events {
+            if event.get("response").is_some() {
+                event["response"]["tools"] = json!([{"type": "function", "name": "shell"}]);
+                event["response"]["tool_choice"] = json!({"type": "function", "name": "shell"});
+            }
+        }
+        let fixture = support::TestFixture::new_with_responses(vec![support::MockResponse::Sse(sse(&events))]).await;
+        let Either::Right(stream) = ExecuteRequest::new(req, fixture.exec_ctx.clone()).run().await.unwrap() else {
+            panic!("expected streaming response");
+        };
+        let chunks = stream.collect::<Vec<_>>().await;
+        let events = support::streamed_sse_events(&chunks);
+        for kind in ["response.created", "response.in_progress", "response.completed"] {
+            let event = events.iter().find(|event| event["type"] == kind).unwrap();
+            assert_eq!(event["response"]["tools"], expected_tools, "{kind}");
+            assert_eq!(event["response"]["tool_choice"], json!({"type": "shell"}), "{kind}");
+        }
     }
 }
 

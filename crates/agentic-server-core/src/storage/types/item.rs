@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::storage::StorageError;
-use crate::types::io::{InputItem, OutputItem};
+use crate::types::io::{InputItem, OutputItem, ResponsesInput};
 use crate::utils::common::serialize_to_value;
 
 pub(crate) const STORED_ITEM_KIND_KEY: &str = "_agentic_item_kind";
@@ -106,14 +106,17 @@ impl InOutItem {
     /// Internal items are removed later by `ResponsesInput::model_input`.
     #[must_use]
     pub fn into_input_items(history: Vec<InOutItem>) -> Vec<InputItem> {
-        history
+        let items = history
             .into_iter()
             .filter_map(|item| match item {
                 InOutItem::Input(item) if item.is_unknown() => None,
                 InOutItem::Input(item) => Some(item),
                 InOutItem::Output(output) => output.to_input_item(),
             })
-            .collect()
+            .collect();
+        // Stored inputs retain their public tool types; lower only the history
+        // copy used for continuation, using the same conversion as new inputs.
+        Vec::from(ResponsesInput::Items(items))
     }
 }
 
