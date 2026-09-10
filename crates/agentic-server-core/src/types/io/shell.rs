@@ -5,6 +5,7 @@ use serde_json::Value;
 
 /// Lifecycle status for a shell call or shell call output item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ShellCallStatus {
     InProgress,
@@ -23,6 +24,7 @@ impl From<crate::types::event::MessageStatus> for ShellCallStatus {
 
 /// Commands and execution limits requested by a model-generated shell call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ShellCallAction {
     pub commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,6 +37,7 @@ pub struct ShellCallAction {
 
 /// A model-generated request to execute one or more shell commands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ShellCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -49,6 +52,7 @@ pub struct ShellCall {
 /// Outcome of one command in a shell call output.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ShellCallOutcome {
     Exit {
@@ -61,6 +65,7 @@ pub enum ShellCallOutcome {
 
 /// Captured output and outcome for one command in a shell call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ShellCallOutputContent {
     #[serde(default)]
     pub stdout: String,
@@ -73,6 +78,7 @@ pub struct ShellCallOutputContent {
 
 /// Output supplied for a previously emitted shell call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ShellCallOutputMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

@@ -1,11 +1,12 @@
 //! Response accumulation and parsing utilities.
 //!
 //! Handles both streaming (SSE) and non-streaming JSON response formats,
-//! accumulating chunks into a unified `ResponsePayload` structure.
+//! accumulating semantic events into a unified `ResponsePayload` structure.
 //!
-//! Streaming path uses a channel + `spawn_blocking` so that SSE JSON parsing
-//! runs on a blocking thread while the async task continues reading from the
-//! network — keeping the tokio executor thread free between chunk arrivals.
+//! The executor path in `upstream.rs` processes SSE lines inline using this
+//! accumulator. The separate [`ResponseAccumulator::from_stream`] convenience
+//! method uses a channel and `spawn_blocking` worker; that worker is not the
+//! executor's main streaming path.
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -26,7 +27,7 @@ use crate::types::event::{MessageStatus, ResponseStatus};
 use crate::types::io::output::McpListTools;
 use crate::types::io::{
     ApplyDone, CompactionItem, CustomToolCall, FunctionToolCall, OutputItem, OutputMessage, OutputTextContent,
-    ReasoningOutput, ResponseUsage, ShellCall,
+    ReasoningOutput, ResponseUsage, ShellCall, ToolSearchCall,
 };
 use crate::types::io::{McpCall, WebSearchCall};
 use crate::types::request_response::{IncompleteDetails, ResponsePayload};
@@ -47,6 +48,9 @@ enum InFlight {
     FunctionCall {
         item: FunctionToolCall,
         arguments: String,
+    },
+    ToolSearchCall {
+        item: ToolSearchCall,
     },
     CustomToolCall {
         item: CustomToolCall,
@@ -77,6 +81,7 @@ impl std::fmt::Debug for InFlight {
             Self::Message { .. } => write!(f, "InFlight::Message {{ .. }}"),
             Self::Reasoning { .. } => write!(f, "InFlight::Reasoning {{ .. }}"),
             Self::FunctionCall { .. } => write!(f, "InFlight::FunctionCall {{ .. }}"),
+            Self::ToolSearchCall { .. } => write!(f, "InFlight::ToolSearchCall {{ .. }}"),
             Self::CustomToolCall { .. } => write!(f, "InFlight::CustomToolCall {{ .. }}"),
             Self::ShellCall { .. } => write!(f, "InFlight::ShellCall {{ .. }}"),
             Self::WebSearchCall { .. } => write!(f, "InFlight::WebSearchCall {{ .. }}"),
@@ -98,6 +103,7 @@ impl InFlight {
                 item.status = MessageStatus::Completed;
                 Some(OutputItem::FunctionCall(item))
             }
+            Self::ToolSearchCall { item } => Some(OutputItem::ToolSearchCall(item)),
             Self::Message { mut item, text } => {
                 if !text.is_empty() {
                     item.content.push(OutputTextContent::new(text));
@@ -1017,6 +1023,9 @@ impl ResponseAccumulator {
                     item,
                     arguments: String::with_capacity(128),
                 }),
+            SSEItemType::ToolSearchCall => ToolSearchCall::try_from(payload)
+                .ok()
+                .map(|item| InFlight::ToolSearchCall { item }),
             SSEItemType::CustomToolCall => {
                 CustomToolCall::try_from(payload)
                     .ok()
@@ -1169,6 +1178,7 @@ impl ResponseAccumulator {
         if let Some(
             mut output_item @ (OutputItem::Reasoning(_)
             | OutputItem::FunctionCall(_)
+            | OutputItem::ToolSearchCall(_)
             | OutputItem::CustomToolCall(_)
             | OutputItem::ShellCall(_)
             | OutputItem::WebSearchCall(_)
@@ -1221,10 +1231,14 @@ impl ResponseAccumulator {
             previous_response_id: previous_response_id.map(str::to_string),
             conversation_id: self.conversation_id,
             instructions: instructions.map(str::to_string),
+            tools: None,
+            tool_choice: None,
         }
     }
 }
 
+// Keep each output-item completion in the same transition dispatcher.
+#[allow(clippy::too_many_lines)]
 fn apply_output_item_done(
     in_flight: &mut InFlight,
     payload: &EventPayload,
@@ -1278,6 +1292,7 @@ fn apply_output_item_done(
             }
             *item = done;
         }
+        (InFlight::ToolSearchCall { item }, Some(OutputItem::ToolSearchCall(done))) => item.clone_from(done),
         (InFlight::CustomToolCall { item, input }, Some(OutputItem::CustomToolCall(done))) => {
             let mut done = done.clone();
             if done.id.is_empty() {
@@ -1324,6 +1339,7 @@ fn apply_output_item_done(
         (InFlight::Reasoning { item }, None) => item.apply_done(payload, &mut String::new()),
         (InFlight::ShellCall { item, command, .. }, None) => item.apply_done(payload, command),
         (InFlight::FunctionCall { item, arguments }, None) => item.apply_done(payload, arguments),
+        (InFlight::ToolSearchCall { item }, None) => item.apply_done(payload, &mut String::new()),
         (InFlight::CustomToolCall { item, input }, None) => item.apply_done(payload, input),
         (InFlight::McpCall { item }, None) => item.apply_done(payload, &mut String::new()),
         (InFlight::McpListTools { item }, None) => item.apply_done(payload, &mut String::new()),
@@ -1335,6 +1351,7 @@ fn apply_output_item_done(
 fn output_item_call_id(item: &OutputItem) -> Option<&str> {
     match item {
         OutputItem::FunctionCall(call) => Some(&call.call_id),
+        OutputItem::ToolSearchCall(call) => Some(&call.call_id),
         OutputItem::CustomToolCall(call) => Some(&call.call_id),
         OutputItem::ShellCall(call) => Some(&call.call_id),
         _ => None,
@@ -1400,6 +1417,7 @@ fn has_explicit_output_index(frame: &EventFrame) -> bool {
 mod tests {
     use super::*;
     use crate::events::WireEvent;
+    use crate::tool::ToolRegistry;
     use crate::types::io::{McpCallError, McpCallStatus, WebSearchCallStatus};
 
     fn from_sse_lines(lines: impl IntoIterator<Item = String>, conversation_id: Option<&str>) -> ResponseAccumulator {
@@ -1838,7 +1856,8 @@ mod tests {
         let added = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":""}}"#;
         let done = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}","status":"completed"}}"#;
         let mut acc = ResponseAccumulator::new("resp_1".to_owned(), None);
-        let mut translator = FunctionSseTranslator::default();
+        let registry = ToolRegistry::default();
+        let mut translator = FunctionSseTranslator::new(&registry);
 
         acc.process_sse_line_with_translator(added, &mut translator)
             .expect("added item is valid");
@@ -1857,7 +1876,8 @@ mod tests {
         let first = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}","status":"completed"}}"#;
         let conflicting = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{\"query\":\"rust\"}","status":"completed"}}"#;
         let mut acc = ResponseAccumulator::new("resp_1".to_owned(), None);
-        let mut translator = FunctionSseTranslator::default();
+        let registry = ToolRegistry::default();
+        let mut translator = FunctionSseTranslator::new(&registry);
 
         acc.process_sse_line_with_translator(added, &mut translator)
             .expect("added item is valid");
@@ -1903,7 +1923,8 @@ mod tests {
         let added = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":""}}"#;
         let conflicting = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","id":"fc_1","call_id":"call_1","name":"lookup","input":"{}","status":"completed"}}"#;
         let mut acc = ResponseAccumulator::new("resp_1".to_owned(), None);
-        let mut translator = FunctionSseTranslator::default();
+        let registry = ToolRegistry::default();
+        let mut translator = FunctionSseTranslator::new(&registry);
 
         acc.process_sse_line_with_translator(added, &mut translator)
             .expect("added item is valid");
@@ -1920,7 +1941,8 @@ mod tests {
         let added_second = r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_2","name":"lookup","arguments":""}}"#;
         let contradictory = r#"data: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","call_id":"call_1","delta":"{}"}"#;
         let mut acc = ResponseAccumulator::new("resp_1".to_owned(), None);
-        let mut translator = FunctionSseTranslator::default();
+        let registry = ToolRegistry::default();
+        let mut translator = FunctionSseTranslator::new(&registry);
 
         acc.process_sse_line_with_translator(added_first, &mut translator)
             .expect("first item is valid");

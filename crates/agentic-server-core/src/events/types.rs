@@ -8,6 +8,7 @@ use crate::types::io::{OutputItem, ResponseUsage, ShellCall};
 pub enum SSEItemType {
     Reasoning,
     FunctionCall,
+    ToolSearchCall,
     CustomToolCall,
     WebSearchCall,
     McpCall,
@@ -23,6 +24,7 @@ impl SSEItemType {
         match self {
             Self::Reasoning => "reasoning",
             Self::FunctionCall => "function_call",
+            Self::ToolSearchCall => "tool_search_call",
             Self::CustomToolCall => "custom_tool_call",
             Self::WebSearchCall => "web_search_call",
             Self::McpCall => "mcp_call",
@@ -47,6 +49,7 @@ impl std::str::FromStr for SSEItemType {
         match value {
             "reasoning" => Ok(Self::Reasoning),
             "function_call" => Ok(Self::FunctionCall),
+            "tool_search_call" => Ok(Self::ToolSearchCall),
             "custom_tool_call" => Ok(Self::CustomToolCall),
             "web_search_call" => Ok(Self::WebSearchCall),
             "mcp_call" => Ok(Self::McpCall),
@@ -66,6 +69,7 @@ impl TryFrom<&OutputItem> for SSEItemType {
         match item {
             OutputItem::Message(_) => Ok(Self::Message),
             OutputItem::FunctionCall(_) => Ok(Self::FunctionCall),
+            OutputItem::ToolSearchCall(_) => Ok(Self::ToolSearchCall),
             OutputItem::CustomToolCall(_) => Ok(Self::CustomToolCall),
             OutputItem::WebSearchCall(_) => Ok(Self::WebSearchCall),
             OutputItem::McpCall(_) => Ok(Self::McpCall),
@@ -252,12 +256,25 @@ impl TryFrom<SSEEventType> for &'static str {
 pub struct WireEvent {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub event_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sequence_number",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sequence_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_index: Option<u64>,
     #[serde(flatten)]
     pub rest: Map<String, Value>,
+}
+
+// Some upstreams use negative integer sentinels for an unspecified sequence.
+// Preserve the full u64 range; client numbering belongs to the stream relay.
+fn deserialize_sequence_number<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i128>::deserialize(deserializer).map(|value| value.and_then(|number| u64::try_from(number).ok()))
 }
 
 impl WireEvent {

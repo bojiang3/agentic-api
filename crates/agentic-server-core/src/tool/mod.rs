@@ -13,6 +13,7 @@ pub mod normalize;
 pub mod ownership;
 pub mod registry;
 pub mod shell;
+pub mod tool_search;
 pub mod web_search;
 
 pub use codex::{CodexNamespaceHandler, NamespaceMap, model_visible_namespace_member_name};
@@ -24,4 +25,6 @@ pub use mcp::{McpClient, McpClientPool, McpDiscoveredHandler, McpError, McpHandl
 pub use ownership::{GatewayBinding, ToolOwnership};
 pub use registry::{GatewayDispatchResult, ToolEntry, ToolRegistry, ToolType};
 pub use shell::ShellHandler;
+pub(crate) use tool_search::ToolSearchMetadata;
+pub use tool_search::{ToolSearchHandler, ToolSearchState};
 pub use web_search::WebSearchHandler;
